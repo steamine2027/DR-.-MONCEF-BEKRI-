@@ -1,0 +1,12 @@
+# Patient data must never be committed
+*.json
+*.sqlite
+*.db
+*.csv
+*.pdf
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
