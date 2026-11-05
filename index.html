@@ -6724,11 +6724,21 @@ setTimeout(backupReminder, 2000);
     return true;
   }
 
+  const RESTORE_FLAG = 'medicore_auto_restore';
+  const patientCount = () => query('SELECT COUNT(*) AS c FROM patients')[0].c;
+  function autoRestoreDone() { try { return sessionStorage.getItem(RESTORE_FLAG) === '1'; } catch (e) { return true; } }
+  function markAutoRestore() { try { sessionStorage.setItem(RESTORE_FLAG, '1'); } catch (e) { /* storage unavailable: no automatic restore */ } }
+
   async function afterLogin() {
     setStatus('busy', '☁️ Vérification du cloud…');
     try {
       const localPatients = query('SELECT COUNT(*) AS c FROM patients')[0].c;
-      if (!localPatients && await restoreFromCloud()) { location.reload(); return; }
+      // Automatic restore: at most once per browser tab, and reload only when patients really came back.
+      // (Before this fix, a cloud holding no live patients made the page reload forever.)
+      if (!localPatients && !autoRestoreDone()) {
+        markAutoRestore();
+        if (await restoreFromCloud() && patientCount() > 0) { location.reload(); return; }
+      }
       warnText = '';
       if (localPatients) {
         const newest = newestOf(await fetchRemote());
