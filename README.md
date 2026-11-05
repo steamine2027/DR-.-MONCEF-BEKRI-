@@ -53,6 +53,14 @@ English and French Wikipedia APIs for the medicine's name only (DCI or brand).
   `consultations`, `ordonnances`, `patient_images`, `certificats`, `certificats_repos`,
   `transactions`, `medicaments`, `settings_kv`.
 
+## Installer sur téléphone
+
+- **Android (Chrome)** : ouvrez le lien, puis menu ⋮ → **Installer l'application** (ou *Ajouter à l'écran d'accueil*).
+- **iPhone (Safari)** : ouvrez le lien, puis Partager → **Sur l'écran d'accueil**.
+
+L'application s'ouvre ensuite en plein écran, comme une application. Une fois ouverte une première fois avec Internet,
+elle reste disponible hors ligne ; les modifications sont envoyées au cloud dès que la connexion revient.
+
 ## Shortcuts
 
 | Keys | Action |
