@@ -18,7 +18,7 @@ document.addEventListener('DOMContentLoaded',function(){
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.min.js"></script>
+<script src="assets/sql-wasm.js"></script>
 <script src="assets/supabase.js"></script>
 <style>
 :root {
@@ -3237,13 +3237,11 @@ const BG_PRESETS = [
 
 async function initApp() {
   try {
-    const SQL = await initSqlJs({ locateFile: f => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${f}` });
-    const saved = localStorage.getItem('medicoreDB');
-    if (saved) {
-      db = new SQL.Database(decodeDB(saved));
-    } else {
-      db = new SQL.Database();
-    }
+    const SQL = await initSqlJs({ locateFile: f => `./assets/${f}` });
+    const saved = await loadDBBytes();
+    db = saved ? new SQL.Database(saved) : new SQL.Database();
+    ensurePersistentStorage();
+    flushDB();   // moves an existing localStorage database into IndexedDB
     createTables();
     seedMedicaments();
     loadSettings();
@@ -3767,15 +3765,6 @@ function seedMedicaments() {
   saveDB();
 }
 
-function saveDB() {
-  if (!db) return;
-  const data = db.export();
-  try {
-    localStorage.setItem('medicoreDB', JSON.stringify(Array.from(data)));
-  } catch(e) {
-    showToast('Avertissement: Données trop volumineuses pour localStorage (images)', 'error');
-  }
-}
 
 function query(sql, params=[]) {
   const stmt = db.prepare(sql);
@@ -3943,8 +3932,7 @@ function importDB(input) {
             run('INSERT OR REPLACE INTO settings_kv(key,value) VALUES(?,?)', [s.key, s.value]);
           });
         }
-        saveDB();
-        location.reload();
+        flushDB().then(() => location.reload());
       });
     } catch(err) {
       showToast('Erreur lors de l\'importation', 'error');
@@ -6207,13 +6195,67 @@ function decodeDB(saved){
 }
 let _dbTimer = null;
 function saveDB(){ if (!db) return; clearTimeout(_dbTimer); _dbTimer = setTimeout(flushDB, 120); }
+
+/* Storage: the database lives in IndexedDB (hundreds of MB, unlike the ~5 MB of localStorage).
+   Writes run one after another; flushDB() resolves once the bytes are on the device, so a
+   reload can wait for it. localStorage is only a fallback when IndexedDB is unavailable. */
+const DB_NAME = 'medicore', DB_STORE = 'kv', DB_KEY = 'db';
+let _idbPromise = null, _writeChain = Promise.resolve();
+function idbOpen(){
+  if (!_idbPromise) {
+    _idbPromise = new Promise((resolve, reject) => {
+      if (!window.indexedDB) return reject(new Error('IndexedDB indisponible'));
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore(DB_STORE);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+      req.onblocked = () => reject(new Error('IndexedDB bloqué'));
+    });
+    _idbPromise.catch(() => { _idbPromise = null; });
+  }
+  return _idbPromise;
+}
+function idbTx(mode, action){
+  return idbOpen().then(d => new Promise((resolve, reject) => {
+    const tx = d.transaction(DB_STORE, mode);
+    const req = action(tx.objectStore(DB_STORE));
+    tx.oncomplete = () => resolve(req.result);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error('écriture annulée'));
+  }));
+}
+async function loadDBBytes(){
+  // localStorage first: it only holds data when an earlier IndexedDB write failed, or from the old version.
+  const legacy = localStorage.getItem('medicoreDB');
+  if (legacy) return decodeDB(legacy);
+  try { return (await idbTx('readonly', s => s.get(DB_KEY))) || null; }
+  catch (e) { console.warn('[storage] IndexedDB read failed', e); return null; }
+}
+async function persistBytes(bytes){
+  try {
+    await idbTx('readwrite', s => s.put(bytes, DB_KEY));
+    localStorage.removeItem('medicoreDB');
+    return;
+  } catch (e) { console.warn('[storage] IndexedDB write failed', e); }
+  try { localStorage.setItem('medicoreDB', encodeDB(bytes)); }
+  catch (e) { showToast('⚠️ Stockage saturé — exportez une sauvegarde JSON', 'error'); }
+}
 function flushDB(){
-  if (!db) return;
+  if (!db) return Promise.resolve();
   clearTimeout(_dbTimer); _dbTimer = null;
-  try { localStorage.setItem('medicoreDB', encodeDB(db.export())); }
-  catch (e) { showToast('⚠️ Stockage du navigateur saturé — exportez une sauvegarde JSON', 'error'); }
+  const bytes = db.export();   // snapshot now; the writes themselves stay in order
+  _writeChain = _writeChain.then(() => persistBytes(bytes));
+  return _writeChain;
 }
 window.addEventListener('pagehide', flushDB);
+async function ensurePersistentStorage(){
+  try {
+    if (navigator.storage && navigator.storage.persist) await navigator.storage.persist();
+    const est = navigator.storage && navigator.storage.estimate ? await navigator.storage.estimate() : null;
+    if (est && est.quota && est.usage / est.quota > 0.85)
+      showToast('⚠️ Espace de stockage presque plein — exportez une sauvegarde JSON', 'error');
+  } catch (e) { /* not supported here: the data is still kept in the browser */ }
+}
 
 /* ── 3 · toast with one shared timer (no early hide) ──────────── */
 let _toastT = null;
@@ -6647,6 +6689,7 @@ setTimeout(backupReminder, 2000);
 
   async function syncNow() {
     if (!client) return;
+    if (!navigator.onLine) { setStatus('off', '📴 Hors ligne · données enregistrées sur cet appareil'); return; }
     if (running) { rerun = true; return; }
     running = true;
     setStatus('busy', '☁️ Sauvegarde en cours…');
@@ -6658,7 +6701,9 @@ setTimeout(backupReminder, 2000);
     } catch (e) {
       console.warn('[cloud] sync failed', e);
       retryMs = Math.min(retryMs ? retryMs * 2 : 5000, 300000);
-      setStatus('err', '⚠️ Non sauvegardé · nouvel essai dans ' + Math.round(retryMs / 1000) + ' s · données conservées sur cet appareil');
+      if (e instanceof TypeError || !navigator.onLine || /fetch|network/i.test(String((e && e.message) || e)))
+        setStatus('off', '📴 Pas de connexion · données enregistrées sur cet appareil · synchro au retour du réseau');
+      else setStatus('err', '⚠️ Non sauvegardé · nouvel essai dans ' + Math.round(retryMs / 1000) + ' s · données conservées sur cet appareil');
       clearTimeout(timer); timer = setTimeout(syncNow, retryMs);
     } finally {
       running = false;
@@ -6731,7 +6776,7 @@ setTimeout(backupReminder, 2000);
     } catch (e) { db.run('ROLLBACK'); throw e; }
     localStorage.setItem(DEVICE_KEY, dev);
     localStorage.removeItem(STATE_KEY);     // next upload re-sends everything under this device (idempotent)
-    flushDB();
+    await flushDB();
     return true;
   }
 
@@ -6741,6 +6786,7 @@ setTimeout(backupReminder, 2000);
   function markAutoRestore() { try { sessionStorage.setItem(RESTORE_FLAG, '1'); } catch (e) { /* storage unavailable: no automatic restore */ } }
 
   async function afterLogin() {
+    if (!navigator.onLine) { setStatus('off', '📴 Hors ligne · données enregistrées sur cet appareil'); return; }
     setStatus('busy', '☁️ Vérification du cloud…');
     try {
       const localPatients = query('SELECT COUNT(*) AS c FROM patients')[0].c;
@@ -6786,9 +6832,10 @@ setTimeout(backupReminder, 2000);
 
   // Every local save also schedules a cloud upload.
   const localFlush = flushDB;
-  flushDB = function () { localFlush(); schedule(2500); };
-  window.addEventListener('online', () => schedule(500));
-  document.addEventListener('visibilitychange', () => { if (document.hidden) schedule(0); });
+  flushDB = function () { const p = localFlush(); schedule(2500); return p; };
+  window.addEventListener('online', () => { if (client) afterLogin(); });
+  window.addEventListener('offline', () => setStatus('off', '📴 Hors ligne · données enregistrées sur cet appareil'));
+  document.addEventListener('visibilitychange', () => { if (document.hidden) { localFlush(); schedule(0); } });
   setInterval(() => schedule(0), 60000);
 
   PALETTE_ACTIONS.push(

@@ -77,3 +77,10 @@ In the repository settings, set **Pages → Source: GitHub Actions** once.
 
 This repository contains **no patient data**. Demo names in the markup are placeholders.
 Do not commit exported backups (`*.json`); `.gitignore` excludes them.
+
+## Hors ligne et stockage des données
+
+- **Première ouverture avec internet** : l'application et son moteur de base de données sont enregistrés sur l'appareil. Ensuite, elle s'ouvre et fonctionne **sans connexion**.
+- **Stockage** : les données sont enregistrées dans la base IndexedDB du navigateur (plusieurs centaines de Mo), et non plus dans localStorage (environ 5 Mo). L'application demande au navigateur de ne pas effacer ces données (stockage persistant).
+- **Sans réseau** : tout est enregistré sur l'appareil. La sauvegarde cloud reprend automatiquement au retour de la connexion.
+- À éviter : vider les données du site dans le navigateur, ou désinstaller le navigateur, sans avoir fait d'abord une sauvegarde JSON.

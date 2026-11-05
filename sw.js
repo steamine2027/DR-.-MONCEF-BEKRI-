@@ -1,8 +1,10 @@
-// MediCore service worker: lets the app install on phones and open without network.
-// Same-origin GET requests are network-first with a cached fallback. The cloud API
-// (supabase.co) is never cached, so the data is always read and written live.
-const CACHE = 'medicore-v2';
+// MediCore service worker: lets the app install on phones and open with no network.
+// The app shell (including the SQLite engine) is cached on the first visit, so the
+// doctor can work offline afterwards. Same-origin GET requests are network-first with a
+// cached fallback. Cloud API calls and fonts are never cached.
+const CACHE = 'medicore-v3';
 const SHELL = ['./', './index.html', './manifest.json', './assets/supabase.js',
+               './assets/sql-wasm.js', './assets/sql-wasm.wasm',
                './assets/icon-192.png', './assets/icon-512.png'];
 
 self.addEventListener('install', event => {
@@ -21,13 +23,11 @@ self.addEventListener('fetch', event => {
   const req = event.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
-  const sameSite = url.origin === self.location.origin;
-  const sqlJs = url.hostname === 'cdnjs.cloudflare.com';
-  if (!sameSite && !sqlJs) return;   // cloud API and other hosts: straight to the network
+  if (url.origin !== self.location.origin) return;   // cloud API and fonts: straight to the network
   event.respondWith(
     fetch(req)
       .then(res => {
-        if (res && (res.ok || res.type === 'opaque')) {
+        if (res && res.ok) {
           const copy = res.clone();
           caches.open(CACHE).then(c => c.put(req, copy)).catch(() => {});
         }
