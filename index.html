@@ -16,6 +16,7 @@ document.addEventListener('DOMContentLoaded',function(){
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 :root {
   --bg-base:       #060a12;
@@ -6503,4 +6504,290 @@ addHeaderButton('finance', '⬇ CSV', exportTransactionsCSV);
 addHeaderButton('patients', '⬇ CSV', exportPatientsCSV);
 setTimeout(backupReminder, 2000);
 </script>
+<script id="cloud-sync">
+/* ── 13 · cloud sync (Supabase) ─────────────────────────────────────────
+   Every local table is mirrored row-by-row into public.clinic_rows.
+   Only changed rows are uploaded. Deletions are soft (deleted_at), so the
+   cloud copy is never destroyed. Local data stays in the browser as the
+   working copy; if the network fails the changes wait and are retried. */
+(function () {
+  const SB_URL = 'https://pqhzebpgmeinfwmviysy.supabase.co';
+  const SB_KEY = 'sb_publishable_0xiGg36ykBDLymAZPqq2Yg_-bGfUXEp';
+  const TABLES = ['patients','appointments','consultations','ordonnances','patient_images',
+                  'settings_kv','certificats','certificats_repos','transactions','medicaments'];
+  const KEY_COL = { settings_kv: 'key' };
+  const STATE_KEY = 'medicore_sync_state', DEVICE_KEY = 'medicore_device_id';
+  const MAX_BATCH_CHARS = 400000;
+
+  let client = null, session = null, timer = null, running = false, rerun = false;
+  let retryMs = 0, warnText = '', statusEl = null;
+
+  const style = document.createElement('style');
+  style.textContent = `
+  #cloud-status{position:fixed;left:14px;bottom:14px;z-index:800;font:600 12px/1.35 Inter,system-ui,sans-serif;padding:7px 13px;border-radius:999px;background:#0b3b4f;color:#fff;box-shadow:0 4px 16px rgba(0,0,0,.25);cursor:pointer;max-width:360px}
+  #cloud-status[data-state=ok]{background:#0f7a5a}
+  #cloud-status[data-state=busy]{background:#1d5fbf}
+  #cloud-status[data-state=warn]{background:#9a5b00}
+  #cloud-status[data-state=err]{background:#a3261c}
+  #cloud-status[data-state=off]{background:#5b6670}
+  #cloud-login{position:fixed;inset:0;z-index:10000;background:rgba(5,12,22,.8);display:flex;align-items:center;justify-content:center;padding:20px;font-family:Inter,system-ui,sans-serif}
+  #cloud-login .cl-card{background:#fff;color:#0b2433;border-radius:16px;padding:28px;width:100%;max-width:380px;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+  #cloud-login h2{margin:0 0 6px;font-size:20px}
+  #cloud-login p{margin:0 0 16px;font-size:13px;color:#4a5b66;line-height:1.5}
+  #cloud-login label{display:block;font-size:12px;font-weight:600;margin-bottom:12px}
+  #cloud-login input{display:block;width:100%;margin-top:5px;padding:10px 12px;border:1px solid #c9d4dc;border-radius:10px;font:inherit;font-weight:400;box-sizing:border-box}
+  #cloud-login .cl-actions{display:flex;gap:10px;margin-top:6px}
+  #cloud-login button{flex:1;padding:11px;border-radius:10px;border:0;font:inherit;font-weight:600;cursor:pointer;background:#0f7a5a;color:#fff}
+  #cloud-login button.alt{background:#e7eef3;color:#0b2433}
+  #cloud-login .cl-msg{min-height:18px;font-size:12px;color:#a3261c;margin-bottom:8px}`;
+  document.head.appendChild(style);
+
+  const uuid = () => (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
+    : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 3 | 8)).toString(16); });
+  const deviceId = () => { let d = localStorage.getItem(DEVICE_KEY); if (!d) { d = uuid(); localStorage.setItem(DEVICE_KEY, d); } return d; };
+  const hash = s => {
+    let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); h1 = Math.imul(h1 ^ c, 2654435761); h2 = Math.imul(h2 ^ c, 1597334677); }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+  };
+  const loadState = () => { try { return JSON.parse(localStorage.getItem(STATE_KEY)) || {}; } catch (e) { return {}; } };
+  const saveState = s => localStorage.setItem(STATE_KEY, JSON.stringify(s));
+  const rowId = (t, row) => String(row[KEY_COL[t] || 'id']);
+  const clock = () => new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+
+  function setStatus(state, text) {
+    if (!statusEl) {
+      statusEl = document.createElement('div');
+      statusEl.id = 'cloud-status';
+      statusEl.title = 'Cliquer pour synchroniser maintenant';
+      statusEl.onclick = () => syncNow();
+      document.body.appendChild(statusEl);
+    }
+    statusEl.dataset.state = state;
+    statusEl.textContent = text;
+  }
+
+  // Group changed rows into requests of bounded size (images can be large).
+  function batches(items) {
+    const out = []; let cur = [], size = 0;
+    for (const it of items) {
+      const s = JSON.stringify(it.r).length;
+      if (cur.length && size + s > MAX_BATCH_CHARS) { out.push(cur); cur = []; size = 0; }
+      cur.push(it); size += s;
+    }
+    if (cur.length) out.push(cur);
+    return out;
+  }
+
+  // Upload only rows that changed since the last successful upload.
+  async function pushAll() {
+    const owner = session.user.id, dev = deviceId(), st = loadState(), now = new Date().toISOString();
+    let sent = 0;
+    for (const t of TABLES) {
+      const prev = st[t] || (st[t] = {});
+      const seen = new Set(), changed = [];
+      for (const r of query('SELECT * FROM ' + t)) {
+        const id = rowId(t, r); seen.add(id);
+        const h = hash(JSON.stringify(r));
+        if (prev[id] !== h) changed.push({ id, h, r });
+      }
+      for (const batch of batches(changed)) {
+        const rows = batch.map(c => ({ owner_id: owner, device_id: dev, table_name: t, row_id: c.id, data: c.r, deleted_at: null }));
+        const { error } = await client.from('clinic_rows').upsert(rows, { onConflict: 'owner_id,device_id,table_name,row_id' });
+        if (error) throw error;
+        batch.forEach(c => { prev[c.id] = c.h; });
+        saveState(st); sent += batch.length;
+      }
+      for (const id of Object.keys(prev)) {
+        if (seen.has(id)) continue;   // still present locally
+        const { error } = await client.from('clinic_rows').update({ deleted_at: now })
+          .match({ owner_id: owner, device_id: dev, table_name: t, row_id: id });
+        if (error) throw error;
+        delete prev[id]; saveState(st); sent++;
+      }
+    }
+    return sent;
+  }
+
+  async function syncNow() {
+    if (!client || !session) return;
+    if (running) { rerun = true; return; }
+    running = true;
+    setStatus('busy', '☁️ Sauvegarde en cours…');
+    try {
+      const n = await pushAll();
+      retryMs = 0;
+      const ok = '☁️ Sauvegardé à ' + clock() + (n ? ' · ' + n + ' modification(s)' : '');
+      setStatus(warnText ? 'warn' : 'ok', warnText || ok);
+    } catch (e) {
+      console.warn('[cloud] sync failed', e);
+      retryMs = Math.min(retryMs ? retryMs * 2 : 5000, 300000);
+      setStatus('err', '⚠️ Non sauvegardé · nouvel essai dans ' + Math.round(retryMs / 1000) + ' s · données conservées sur cet appareil');
+      clearTimeout(timer); timer = setTimeout(syncNow, retryMs);
+    } finally {
+      running = false;
+      if (rerun) { rerun = false; schedule(300); }
+    }
+  }
+
+  function schedule(delay = 2500) {
+    if (!client || !session) return;
+    clearTimeout(timer); timer = setTimeout(syncNow, delay);
+  }
+
+  // All remote rows that are still live, paged (PostgREST returns at most 1000 per request).
+  async function fetchRemote() {
+    const all = [];
+    for (let from = 0; ; from += 1000) {
+      const { data, error } = await client.from('clinic_rows')
+        .select('device_id,table_name,row_id,data,updated_at')
+        .is('deleted_at', null)
+        .order('updated_at', { ascending: false }).order('device_id').order('table_name').order('row_id')
+        .range(from, from + 999);
+      if (error) throw error;
+      all.push(...data);
+      if (data.length < 1000) break;
+    }
+    return all;
+  }
+  const newestOf = rows => rows.length ? rows.reduce((a, b) => (b.updated_at > a.updated_at ? b : a)) : null;
+
+  // Replace this browser's data with the most recently written device in the cloud.
+  async function restoreFromCloud() {
+    const rows = await fetchRemote();
+    const newest = newestOf(rows);
+    if (!newest) return false;
+    const dev = newest.device_id;
+    const mine = rows.filter(r => r.device_id === dev);
+    db.run('BEGIN');
+    try {
+      for (const t of TABLES) {
+        const trs = mine.filter(r => r.table_name === t);
+        if (!trs.length) continue;          // keep local seed data when the cloud has none for this table
+        db.run('DELETE FROM ' + t);
+        for (const r of trs) {
+          const cols = Object.keys(r.data);
+          db.run('INSERT OR REPLACE INTO ' + t + ' (' + cols.join(',') + ') VALUES (' + cols.map(() => '?').join(',') + ')',
+                 cols.map(c => r.data[c]));
+        }
+      }
+      db.run('COMMIT');
+    } catch (e) { db.run('ROLLBACK'); throw e; }
+    localStorage.setItem(DEVICE_KEY, dev);
+    localStorage.removeItem(STATE_KEY);     // next upload re-sends everything under this device (idempotent)
+    flushDB();
+    return true;
+  }
+
+  function showLogin(message) {
+    if (document.getElementById('cloud-login')) return;
+    const o = document.createElement('div');
+    o.id = 'cloud-login';
+    o.innerHTML = '<form class="cl-card" id="cl-form">' +
+      '<h2>Connexion MediCore</h2>' +
+      '<p>Vos données sont enregistrées automatiquement dans le cloud et ne sont accessibles qu’après connexion.</p>' +
+      '<label>Email<input type="email" id="cl-email" autocomplete="username" required></label>' +
+      '<label>Mot de passe (8 caractères minimum)<input type="password" id="cl-pass" autocomplete="current-password" minlength="8" required></label>' +
+      '<div class="cl-msg" id="cl-msg"></div>' +
+      '<div class="cl-actions"><button type="submit">Se connecter</button><button type="button" class="alt" id="cl-up">Créer le compte</button></div>' +
+      '</form>';
+    document.body.appendChild(o);
+    const msg = t => { o.querySelector('#cl-msg').textContent = t || ''; };
+    const email = () => o.querySelector('#cl-email').value.trim();
+    const pass = () => o.querySelector('#cl-pass').value;
+    if (message) msg(message);
+    o.querySelector('#cl-form').onsubmit = async ev => {
+      ev.preventDefault(); msg('Connexion…');
+      const { data, error } = await client.auth.signInWithPassword({ email: email(), password: pass() });
+      if (error) return msg('Connexion refusée : ' + error.message);
+      o.remove(); session = data.session; afterLogin();
+    };
+    o.querySelector('#cl-up').onclick = async () => {
+      if (!o.querySelector('#cl-form').reportValidity()) return;
+      msg('Création du compte…');
+      const { data, error } = await client.auth.signUp({ email: email(), password: pass() });
+      if (error) return msg('Création impossible : ' + error.message);
+      if (data.session) { o.remove(); session = data.session; afterLogin(); }
+      else msg('Compte créé. Confirmez votre email, puis connectez-vous.');
+    };
+  }
+
+  async function afterLogin() {
+    setStatus('busy', '☁️ Vérification du cloud…');
+    try {
+      const localPatients = query('SELECT COUNT(*) AS c FROM patients')[0].c;
+      if (!localPatients && await restoreFromCloud()) { location.reload(); return; }
+      warnText = '';
+      if (localPatients) {
+        const newest = newestOf(await fetchRemote());
+        if (newest && newest.device_id !== deviceId())
+          warnText = '⚠️ Le cloud a une version plus récente d’un autre appareil · Ctrl+K › Restaurer du cloud';
+      }
+      syncNow();   // this device's changes are always uploaded; other devices' rows are never overwritten
+    } catch (e) {
+      console.warn('[cloud] startup failed', e);
+      setStatus('err', '⚠️ Cloud injoignable · données locales conservées · nouvel essai bientôt');
+      setTimeout(afterLogin, 15000);
+    }
+  }
+
+  function manualRestore() {
+    confirmAction('Restaurer depuis le cloud ? Les données de cet appareil seront remplacées par la dernière version du cloud. Une sauvegarde JSON est téléchargée avant.', async () => {
+      try { exportDB(); } catch (e) { /* export is a safety net; keep going */ }
+      setStatus('busy', '☁️ Restauration…');
+      try {
+        if (await restoreFromCloud()) location.reload();
+        else showToast('Aucune donnée dans le cloud');
+      } catch (e) { setStatus('err', '⚠️ Restauration impossible · ' + (e.message || 'réseau')); }
+    });
+  }
+
+  async function signOut() {
+    try { await client.auth.signOut(); } catch (e) { /* ignore */ }
+    localStorage.removeItem(STATE_KEY);
+    location.reload();
+  }
+
+  async function boot() {
+    if (!window.supabase || !window.supabase.createClient) {
+      setStatus('off', '📴 Hors ligne · données locales (sauvegarde cloud inactive)');
+      return;
+    }
+    client = window.supabase.createClient(SB_URL, SB_KEY, { auth: { persistSession: true, autoRefreshToken: true } });
+    client.auth.onAuthStateChange((_evt, s) => { session = s; });
+    const { data } = await client.auth.getSession();
+    session = data.session;
+    if (session) return afterLogin();
+    if (navigator.onLine) { setStatus('off', '🔒 Connexion requise pour la sauvegarde cloud'); showLogin(); }
+    else {
+      setStatus('off', '📴 Hors ligne · connexion requise pour la sauvegarde cloud');
+      window.addEventListener('online', () => boot(), { once: true });
+    }
+  }
+
+  // Hook into the existing local save path: every local write also schedules a cloud upload.
+  const localFlush = flushDB;
+  flushDB = function () { localFlush(); schedule(2500); };
+  window.addEventListener('online', () => schedule(500));
+  document.addEventListener('visibilitychange', () => { if (document.hidden) schedule(0); });
+  setInterval(() => schedule(0), 60000);
+
+  PALETTE_ACTIONS.push(
+    { icon: '☁️', label: 'Synchroniser maintenant', run: () => syncNow() },
+    { icon: '⬇️', label: 'Restaurer depuis le cloud', run: () => manualRestore() },
+    { icon: '🚪', label: 'Se déconnecter du cloud', run: () => signOut() }
+  );
+
+  window.CloudSync = { syncNow, restoreFromCloud, fetchRemote, pushAll };
+
+  setStatus('busy', '☁️ Démarrage…');
+  (function waitForDb() {
+    if (typeof db === 'undefined' || db === null) return setTimeout(waitForDb, 100);
+    boot();
+  })();
+})();
+</script>
+
 </body></html>

@@ -1,4 +1,53 @@
--- MediCore — database schema (SQLite).
+-- ════════════════════════════════════════════════════════════════════
+-- CLOUD (Supabase, PostgreSQL) — applied to project "DR MONCEF BEKRI"
+-- Every row of every local table is mirrored here as JSON, per signed-in owner.
+-- Rows are never hard-deleted: a deletion only sets deleted_at.
+-- ════════════════════════════════════════════════════════════════════
+create table if not exists public.clinic_rows (
+  owner_id   uuid        not null default auth.uid() references auth.users(id) on delete cascade,
+  device_id  text        not null,
+  table_name text        not null,
+  row_id     text        not null,
+  data       jsonb       not null default '{}'::jsonb,
+  updated_at timestamptz not null default now(),
+  deleted_at timestamptz,
+  primary key (owner_id, device_id, table_name, row_id)
+);
+
+create index if not exists clinic_rows_owner_device_idx
+  on public.clinic_rows (owner_id, device_id, table_name);
+
+create or replace function public.clinic_rows_touch()
+returns trigger language plpgsql set search_path = '' as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$;
+
+drop trigger if exists clinic_rows_touch on public.clinic_rows;
+create trigger clinic_rows_touch
+  before update on public.clinic_rows
+  for each row execute function public.clinic_rows_touch();
+
+alter table public.clinic_rows enable row level security;
+
+create policy "clinic_rows_select_own" on public.clinic_rows
+  for select to authenticated using (owner_id = (select auth.uid()));
+create policy "clinic_rows_insert_own" on public.clinic_rows
+  for insert to authenticated with check (owner_id = (select auth.uid()));
+create policy "clinic_rows_update_own" on public.clinic_rows
+  for update to authenticated
+  using (owner_id = (select auth.uid()))
+  with check (owner_id = (select auth.uid()));
+-- Deliberately NO delete policy: rows cannot be removed through the API.
+
+revoke all on public.clinic_rows from anon;
+revoke all on public.clinic_rows from authenticated;
+grant select, insert, update on public.clinic_rows to authenticated;
+
+-- ════════════════════════════════════════════════════════════════════
+-- LOCAL — MediCore database schema (SQLite, browser working copy).
 -- The app creates these tables automatically on first load (createTables() in index.html).
 -- The table and column definitions below match createTables() exactly.
 -- The CREATE INDEX lines at the bottom are NOT created by the app; they are optional
