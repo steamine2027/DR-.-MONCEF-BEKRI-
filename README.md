@@ -19,8 +19,8 @@ English and French Wikipedia APIs for the medicine's name only (DCI or brand).
 - **Cloud copy:** Supabase project **DR MONCEF BEKRI** (region eu-north-1, Stockholm),
   table `public.clinic_rows`. Every table row is stored there as JSON, under the
   signed-in doctor's account.
-- **Sign-in is required** when the app is online. Without a session, the screen shows a
-  login form. Create the account from the same form, then confirm the email if Supabase asks.
+- **No sign-in.** The app writes straight to the database with the publishable key.
+  Every row belongs to one clinic id (`6f1d2c3a-0000-4000-8000-00000000c11c`).
 - Each change is uploaded within a few seconds. The badge in the bottom-left corner shows
   the state: saved, saving, waiting for the network, or offline. Click it to sync now.
 - If the network is down, changes stay in the browser and upload when the connection returns.
@@ -39,11 +39,11 @@ English and French Wikipedia APIs for the medicine's name only (DCI or brand).
 
 ## Security
 
-- Row-level security is on. A signed-in user can read and write only their own rows (`owner_id = auth.uid()`).
-  Anonymous visitors see nothing.
-- The publishable key in `index.html` is designed to be public. Access control comes from
-  sign-in and RLS, not from keeping the key secret.
-- Local data stays in the browser after sign-out. Clear the site data to remove it from a computer.
+- **Accepted risk (owner's decision):** without sign-in, anyone who has the site link and the
+  publishable key (visible in the page source) can read and change the clinic's rows.
+  Rows cannot be hard-deleted through the API, but they can be overwritten or soft-deleted.
+- Row-level security limits every request to the clinic id above; there is no DELETE policy.
+- Do not put real patient records in this version until you decide on sign-in or another access control.
 - Health data: check your legal obligations on storing patient data before using real records.
 
 ## Database

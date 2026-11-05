@@ -4,7 +4,7 @@
 -- Rows are never hard-deleted: a deletion only sets deleted_at.
 -- ════════════════════════════════════════════════════════════════════
 create table if not exists public.clinic_rows (
-  owner_id   uuid        not null default auth.uid() references auth.users(id) on delete cascade,
+  owner_id   uuid        not null default '6f1d2c3a-0000-4000-8000-00000000c11c'::uuid,
   device_id  text        not null,
   table_name text        not null,
   row_id     text        not null,
@@ -32,19 +32,20 @@ create trigger clinic_rows_touch
 
 alter table public.clinic_rows enable row level security;
 
-create policy "clinic_rows_select_own" on public.clinic_rows
-  for select to authenticated using (owner_id = (select auth.uid()));
-create policy "clinic_rows_insert_own" on public.clinic_rows
-  for insert to authenticated with check (owner_id = (select auth.uid()));
-create policy "clinic_rows_update_own" on public.clinic_rows
-  for update to authenticated
-  using (owner_id = (select auth.uid()))
-  with check (owner_id = (select auth.uid()));
+create policy clinic_rows_select_clinic on public.clinic_rows
+  for select to anon, authenticated
+  using (owner_id = '6f1d2c3a-0000-4000-8000-00000000c11c'::uuid);
+create policy clinic_rows_insert_clinic on public.clinic_rows
+  for insert to anon, authenticated
+  with check (owner_id = '6f1d2c3a-0000-4000-8000-00000000c11c'::uuid);
+create policy clinic_rows_update_clinic on public.clinic_rows
+  for update to anon, authenticated
+  using (owner_id = '6f1d2c3a-0000-4000-8000-00000000c11c'::uuid)
+  with check (owner_id = '6f1d2c3a-0000-4000-8000-00000000c11c'::uuid);
 -- Deliberately NO delete policy: rows cannot be removed through the API.
 
-revoke all on public.clinic_rows from anon;
-revoke all on public.clinic_rows from authenticated;
-grant select, insert, update on public.clinic_rows to authenticated;
+revoke all on public.clinic_rows from anon, authenticated;
+grant select, insert, update on public.clinic_rows to anon, authenticated;
 
 -- ════════════════════════════════════════════════════════════════════
 -- LOCAL — MediCore database schema (SQLite, browser working copy).

@@ -6512,6 +6512,7 @@ setTimeout(backupReminder, 2000);
 (function () {
   const SB_URL = 'https://pqhzebpgmeinfwmviysy.supabase.co';
   const SB_KEY = 'sb_publishable_0xiGg36ykBDLymAZPqq2Yg_-bGfUXEp';
+  const OWNER = '6f1d2c3a-0000-4000-8000-00000000c11c';   // the clinic: one fixed id for every row
   const TABLES = ['patients','appointments','consultations','ordonnances','patient_images',
                   'settings_kv','certificats','certificats_repos','transactions','medicaments'];
   const KEY_COL = { settings_kv: 'key' };
@@ -6519,7 +6520,7 @@ setTimeout(backupReminder, 2000);
   const MAX_BATCH_CHARS = 400000;
   const PART_CHARS = 100000;
 
-  let client = null, session = null, timer = null, running = false, rerun = false;
+  let client = null, timer = null, running = false, rerun = false;
   let retryMs = 0, warnText = '', statusEl = null;
 
   const style = document.createElement('style');
@@ -6529,17 +6530,7 @@ setTimeout(backupReminder, 2000);
   #cloud-status[data-state=busy]{background:#1d5fbf}
   #cloud-status[data-state=warn]{background:#9a5b00}
   #cloud-status[data-state=err]{background:#a3261c}
-  #cloud-status[data-state=off]{background:#5b6670}
-  #cloud-login{position:fixed;inset:0;z-index:10000;background:rgba(5,12,22,.8);display:flex;align-items:center;justify-content:center;padding:20px;font-family:Inter,system-ui,sans-serif}
-  #cloud-login .cl-card{background:#fff;color:#0b2433;border-radius:16px;padding:28px;width:100%;max-width:380px;box-shadow:0 20px 60px rgba(0,0,0,.4)}
-  #cloud-login h2{margin:0 0 6px;font-size:20px}
-  #cloud-login p{margin:0 0 16px;font-size:13px;color:#4a5b66;line-height:1.5}
-  #cloud-login label{display:block;font-size:12px;font-weight:600;margin-bottom:12px}
-  #cloud-login input{display:block;width:100%;margin-top:5px;padding:10px 12px;border:1px solid #c9d4dc;border-radius:10px;font:inherit;font-weight:400;box-sizing:border-box}
-  #cloud-login .cl-actions{display:flex;gap:10px;margin-top:6px}
-  #cloud-login button{flex:1;padding:11px;border-radius:10px;border:0;font:inherit;font-weight:600;cursor:pointer;background:#0f7a5a;color:#fff}
-  #cloud-login button.alt{background:#e7eef3;color:#0b2433}
-  #cloud-login .cl-msg{min-height:18px;font-size:12px;color:#a3261c;margin-bottom:8px;line-height:1.4}`;
+  #cloud-status[data-state=off]{background:#5b6670}`;
   document.head.appendChild(style);
 
   const uuid = () => (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
@@ -6601,13 +6592,13 @@ setTimeout(backupReminder, 2000);
 
   async function retire(t, ids, now) {
     const { error } = await client.from('clinic_rows').update({ deleted_at: now })
-      .match({ owner_id: session.user.id, device_id: deviceId(), table_name: t }).in('row_id', ids);
+      .match({ owner_id: OWNER, device_id: deviceId(), table_name: t }).in('row_id', ids);
     if (error) throw error;
   }
 
   // Upload only rows that changed since the last successful upload.
   async function pushAll() {
-    const owner = session.user.id, dev = deviceId(), st = loadState(), now = new Date().toISOString();
+    const owner = OWNER, dev = deviceId(), st = loadState(), now = new Date().toISOString();
     let sent = 0;
     for (const t of TABLES) {
       const prev = st[t] || (st[t] = {});
@@ -6644,7 +6635,7 @@ setTimeout(backupReminder, 2000);
   }
 
   async function syncNow() {
-    if (!client || !session) return;
+    if (!client) return;
     if (running) { rerun = true; return; }
     running = true;
     setStatus('busy', '☁️ Sauvegarde en cours…');
@@ -6665,7 +6656,7 @@ setTimeout(backupReminder, 2000);
   }
 
   function schedule(delay = 2500) {
-    if (!client || !session) return;
+    if (!client) return;
     clearTimeout(timer); timer = setTimeout(syncNow, delay);
   }
 
@@ -6733,48 +6724,6 @@ setTimeout(backupReminder, 2000);
     return true;
   }
 
-  // Plain-language messages for the sign-in screen.
-  function authMessage(err) {
-    const m = (err && err.message) || '';
-    if (/invalid login credentials/i.test(m)) return 'Email ou mot de passe incorrect. Pas encore de compte ? Cliquez sur « Créer le compte ».';
-    if (/email not confirmed/i.test(m)) return 'Confirmez d’abord votre email (lien reçu par email), puis reconnectez-vous.';
-    if (/already registered|already been registered|already exists/i.test(m)) return 'Un compte existe déjà avec cet email : cliquez sur « Se connecter ».';
-    return 'Erreur : ' + (m || 'réessayez');
-  }
-
-  function showLogin(message) {
-    if (document.getElementById('cloud-login')) return;
-    const o = document.createElement('div');
-    o.id = 'cloud-login';
-    o.innerHTML = '<form class="cl-card" id="cl-form">' +
-      '<h2>Connexion MediCore</h2>' +
-      '<p>Vos données sont enregistrées automatiquement dans le cloud et ne sont accessibles qu’après connexion.</p>' +
-      '<label>Email<input type="email" id="cl-email" autocomplete="username" required></label>' +
-      '<label>Mot de passe (8 caractères minimum)<input type="password" id="cl-pass" autocomplete="current-password" minlength="8" required></label>' +
-      '<div class="cl-msg" id="cl-msg"></div>' +
-      '<div class="cl-actions"><button type="submit">Se connecter</button><button type="button" class="alt" id="cl-up">Créer le compte</button></div>' +
-      '</form>';
-    document.body.appendChild(o);
-    const msg = t => { o.querySelector('#cl-msg').textContent = t || ''; };
-    const email = () => o.querySelector('#cl-email').value.trim();
-    const pass = () => o.querySelector('#cl-pass').value;
-    if (message) msg(message);
-    o.querySelector('#cl-form').onsubmit = async ev => {
-      ev.preventDefault(); msg('Connexion…');
-      const { data, error } = await client.auth.signInWithPassword({ email: email(), password: pass() });
-      if (error) return msg(authMessage(error));
-      o.remove(); session = data.session; afterLogin();
-    };
-    o.querySelector('#cl-up').onclick = async () => {
-      if (!o.querySelector('#cl-form').reportValidity()) return;
-      msg('Création du compte…');
-      const { data, error } = await client.auth.signUp({ email: email(), password: pass() });
-      if (error) return msg(authMessage(error));
-      if (data.session) { o.remove(); session = data.session; afterLogin(); }
-      else msg('Compte créé. Ouvrez l’email de confirmation, puis connectez-vous.');
-    };
-  }
-
   async function afterLogin() {
     setStatus('busy', '☁️ Vérification du cloud…');
     try {
@@ -6805,27 +6754,13 @@ setTimeout(backupReminder, 2000);
     });
   }
 
-  async function signOut() {
-    try { await client.auth.signOut(); } catch (e) { /* ignore */ }
-    localStorage.removeItem(STATE_KEY);
-    location.reload();
-  }
-
   async function boot() {
     if (!window.supabase || !window.supabase.createClient) {
       setStatus('off', '📴 Hors ligne · données locales (sauvegarde cloud inactive)');
       return;
     }
-    client = window.supabase.createClient(SB_URL, SB_KEY, { auth: { persistSession: true, autoRefreshToken: true } });
-    client.auth.onAuthStateChange((_evt, s) => { session = s; });
-    const { data } = await client.auth.getSession();
-    session = data.session;
-    if (session) return afterLogin();
-    if (navigator.onLine) { setStatus('off', '🔒 Connexion requise pour la sauvegarde cloud'); showLogin(); }
-    else {
-      setStatus('off', '📴 Hors ligne · connexion requise pour la sauvegarde cloud');
-      window.addEventListener('online', () => boot(), { once: true });
-    }
+    client = window.supabase.createClient(SB_URL, SB_KEY, { auth: { persistSession: false, autoRefreshToken: false } });
+    afterLogin();
   }
 
   // Every local save also schedules a cloud upload.
@@ -6837,8 +6772,7 @@ setTimeout(backupReminder, 2000);
 
   PALETTE_ACTIONS.push(
     { icon: '☁️', label: 'Synchroniser maintenant', run: () => syncNow() },
-    { icon: '⬇️', label: 'Restaurer depuis le cloud', run: () => manualRestore() },
-    { icon: '🚪', label: 'Se déconnecter du cloud', run: () => signOut() }
+    { icon: '⬇️', label: 'Restaurer depuis le cloud', run: () => manualRestore() }
   );
 
   window.CloudSync = { syncNow, restoreFromCloud, fetchRemote, pushAll };
