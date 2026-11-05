@@ -1442,6 +1442,14 @@ body.nav-open .nav-scrim{opacity:1;pointer-events:auto}
 .brand-logo--lg{width:120px;height:120px;margin:0 0 18px}
 .ordo-logo{display:block;width:76px;height:76px;margin:0 0 8px;object-fit:contain}
 </style>
+<style id="mobile-layer">
+/* Phones: solid menu, no costly blur behind it (the blur made the menu look stuck). */
+@media (max-width:900px){
+  #sidebar{background:#ffffff !important;-webkit-backdrop-filter:none !important;backdrop-filter:none !important}
+  .nav-scrim{background:rgba(10,20,35,.42) !important;-webkit-backdrop-filter:none !important;backdrop-filter:none !important}
+  .modal-overlay,#palette,#lightbox{-webkit-backdrop-filter:none !important;backdrop-filter:none !important}
+}
+</style>
 </head>
 <body>
 
@@ -6799,4 +6807,99 @@ setTimeout(backupReminder, 2000);
 </script>
 
 <script>if ('serviceWorker' in navigator) { window.addEventListener('load', function () { navigator.serviceWorker.register('sw.js').catch(function (e) { console.warn('[pwa]', e); }); }); }</script>
+<script id="mobile-layer-js">
+/* ── 14 · mobile: downloads and install inside in-app browsers ────────
+   In-app browsers (TikTok, WhatsApp, Facebook…) block file downloads and
+   cannot install apps. We share the file when possible, fall back to a
+   normal download, and tell the user to open the link in Chrome. */
+(function () {
+  const INAPP = /FBAN|FBAV|Instagram|TikTok|musical_ly|BytedanceWebview|Line\/|MicroMessenger|WhatsApp|Snapchat|Messenger|GSA\/|; wv\)/i;
+  const inAppBrowser = () => INAPP.test(navigator.userAgent || '');
+
+  async function copyText(t) {
+    try { await navigator.clipboard.writeText(t); return true; }
+    catch (e) {
+      const ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta);
+      ta.select(); const ok = document.execCommand('copy'); ta.remove(); return ok;
+    }
+  }
+
+  function showDownloadPanel(name, text) {
+    document.getElementById('dl-panel')?.remove();
+    const o = document.createElement('div');
+    o.id = 'dl-panel';
+    o.style.cssText = 'position:fixed;inset:0;z-index:9500;background:rgba(10,20,35,.55);display:flex;align-items:flex-end;justify-content:center;padding:12px;font-family:Inter,system-ui,sans-serif';
+    o.innerHTML = '<div style="background:#fff;color:#0b2433;border-radius:16px;padding:18px;width:100%;max-width:520px;max-height:85vh;overflow:auto;box-shadow:0 20px 60px rgba(0,0,0,.35)">' +
+      '<div style="font-weight:700;margin-bottom:6px">Télécharger « ' + esc(name) + ' »</div>' +
+      '<div style="font-size:13px;color:#4a5b66;line-height:1.5;margin-bottom:10px">Ce navigateur intégré (TikTok, WhatsApp…) ne peut pas enregistrer de fichier. Ouvrez MediCore dans Chrome pour le télécharger' + (text ? ', ou copiez le contenu ci-dessous.' : '.') + '</div>' +
+      (text ? '<textarea readonly style="width:100%;height:160px;font-size:12px;border:1px solid #c9d4dc;border-radius:10px;padding:8px;box-sizing:border-box"></textarea>' : '') +
+      '<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">' +
+      (text ? '<button id="dl-copy" style="flex:1;padding:11px;border-radius:10px;border:0;background:#0f7a5a;color:#fff;font-weight:600">Copier le contenu</button>' : '') +
+      '<button id="dl-close" style="flex:1;padding:11px;border-radius:10px;border:0;background:#e7eef3;color:#0b2433;font-weight:600">Fermer</button></div></div>';
+    document.body.appendChild(o);
+    const ta = o.querySelector('textarea'); if (ta) ta.value = text;
+    o.querySelector('#dl-close').onclick = () => o.remove();
+    const cp = o.querySelector('#dl-copy');
+    if (cp) cp.onclick = async () => { cp.textContent = (await copyText(text)) ? 'Copié ✓' : 'Copie impossible'; };
+  }
+
+  // Share sheet first (lets the user save to Files, Drive, etc.), then a normal download.
+  function deliverFile(name, mime, content) {
+    const blob = new Blob([content], { type: mime });
+    const file = new File([blob], name, { type: mime });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      navigator.share({ files: [file], title: name }).catch(() => {});
+      return;
+    }
+    const url = URL.createObjectURL(blob);
+    const a = Object.assign(document.createElement('a'), { href: url, download: name });
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    if (inAppBrowser()) showDownloadPanel(name, mime.startsWith('text/') ? String(content).replace(/^\uFEFF/, '') : '');
+  }
+
+  // Same content as before, delivered through deliverFile.
+  exportDB = function () {
+    const data = {
+      patients: query('SELECT * FROM patients'),
+      appointments: query('SELECT * FROM appointments'),
+      consultations: query('SELECT * FROM consultations'),
+      ordonnances: query('SELECT * FROM ordonnances'),
+      patient_images: query('SELECT * FROM patient_images'),
+      certificats: query('SELECT * FROM certificats'),
+      certificats_repos: query('SELECT * FROM certificats_repos'),
+      transactions: query('SELECT * FROM transactions'),
+      medicaments: query('SELECT * FROM medicaments'),
+      settings: query('SELECT * FROM settings_kv'),
+      exported_at: new Date().toISOString()
+    };
+    deliverFile('medicore_backup_' + ymd(new Date()) + '.json', 'application/json', JSON.stringify(data, null, 2));
+    localStorage.setItem('medicore_last_backup', String(Date.now()));
+    showToast('Export effectué ✓', 'success');
+  };
+
+  downloadCSV = function (name, rows) {
+    const csv = '﻿' + rows.map(r => r.map(csvCell).join(';')).join('\r\n');
+    deliverFile(name + '_' + ymd(new Date()) + '.csv', 'text/csv;charset=utf-8', csv);
+  };
+
+  function showOpenInChrome() {
+    if (!inAppBrowser() || document.getElementById('inapp-banner')) return;
+    const b = document.createElement('div');
+    b.id = 'inapp-banner';
+    b.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:9000;background:#0b3b4f;color:#fff;padding:12px 14px;font:600 13px/1.4 Inter,system-ui,sans-serif;display:flex;gap:10px;align-items:center;box-shadow:0 -6px 20px rgba(0,0,0,.25)';
+    b.innerHTML = '<span style="flex:1">Pour <b>installer</b> MediCore et <b>télécharger</b> les fichiers, ouvrez ce lien dans Chrome.</span>' +
+      '<button id="inapp-copy" style="padding:8px 10px;border-radius:8px;border:0;background:#0f7a5a;color:#fff;font:600 12px Inter,system-ui">Copier le lien</button>' +
+      '<button id="inapp-x" aria-label="Fermer" style="padding:6px 8px;border:0;background:transparent;color:#fff;font-size:16px">✕</button>';
+    document.body.appendChild(b);
+    b.querySelector('#inapp-copy').onclick = async function () {
+      const ok = await copyText(location.href);
+      this.textContent = ok ? 'Lien copié ✓' : location.href;
+    };
+    b.querySelector('#inapp-x').onclick = () => b.remove();
+  }
+  window.addEventListener('load', showOpenInChrome);
+  window.MediCoreMobile = { deliverFile, inAppBrowser };
+})();
+</script>
 </body></html>
