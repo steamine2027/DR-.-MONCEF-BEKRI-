@@ -1,5 +1,6 @@
 # Patient data must never be committed
 *.json
+!manifest.json
 *.sqlite
 *.db
 *.csv
