@@ -10,7 +10,7 @@ Open `index.html` in a modern browser (Chrome, Edge, Firefox, Safari), or use th
 GitHub Pages link once it is enabled.
 
 The app loads sql.js (SQLite in WebAssembly) from cdnjs.cloudflare.com, the Supabase
-client from cdn.jsdelivr.net, and fonts from Google Fonts. For drug thumbnails it asks the
+client from `assets/supabase.js` (bundled), and fonts from Google Fonts. For drug thumbnails it asks the
 English and French Wikipedia APIs for the medicine's name only (DCI or brand).
 
 ## Where the data lives

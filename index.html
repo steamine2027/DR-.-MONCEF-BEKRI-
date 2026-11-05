@@ -16,7 +16,7 @@ document.addEventListener('DOMContentLoaded',function(){
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="assets/supabase.js"></script>
 <style>
 :root {
   --bg-base:       #060a12;
@@ -6506,10 +6506,9 @@ setTimeout(backupReminder, 2000);
 </script>
 <script id="cloud-sync">
 /* ── 13 · cloud sync (Supabase) ─────────────────────────────────────────
-   Every local table is mirrored row-by-row into public.clinic_rows.
+   Every local table is mirrored row by row into public.clinic_rows.
    Only changed rows are uploaded. Deletions are soft (deleted_at), so the
-   cloud copy is never destroyed. Local data stays in the browser as the
-   working copy; if the network fails the changes wait and are retried. */
+   cloud copy is never destroyed. Big rows (photos) are split into parts. */
 (function () {
   const SB_URL = 'https://pqhzebpgmeinfwmviysy.supabase.co';
   const SB_KEY = 'sb_publishable_0xiGg36ykBDLymAZPqq2Yg_-bGfUXEp';
@@ -6518,6 +6517,7 @@ setTimeout(backupReminder, 2000);
   const KEY_COL = { settings_kv: 'key' };
   const STATE_KEY = 'medicore_sync_state', DEVICE_KEY = 'medicore_device_id';
   const MAX_BATCH_CHARS = 400000;
+  const PART_CHARS = 100000;
 
   let client = null, session = null, timer = null, running = false, rerun = false;
   let retryMs = 0, warnText = '', statusEl = null;
@@ -6539,7 +6539,7 @@ setTimeout(backupReminder, 2000);
   #cloud-login .cl-actions{display:flex;gap:10px;margin-top:6px}
   #cloud-login button{flex:1;padding:11px;border-radius:10px;border:0;font:inherit;font-weight:600;cursor:pointer;background:#0f7a5a;color:#fff}
   #cloud-login button.alt{background:#e7eef3;color:#0b2433}
-  #cloud-login .cl-msg{min-height:18px;font-size:12px;color:#a3261c;margin-bottom:8px}`;
+  #cloud-login .cl-msg{min-height:18px;font-size:12px;color:#a3261c;margin-bottom:8px;line-height:1.4}`;
   document.head.appendChild(style);
 
   const uuid = () => (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
@@ -6556,6 +6556,8 @@ setTimeout(backupReminder, 2000);
   const saveState = s => localStorage.setItem(STATE_KEY, JSON.stringify(s));
   const rowId = (t, row) => String(row[KEY_COL[t] || 'id']);
   const clock = () => new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+  // state entries used to be a bare hash string; accept both shapes
+  const meta = v => (typeof v === 'string' ? { h: v, n: 1 } : v);
 
   function setStatus(state, text) {
     if (!statusEl) {
@@ -6569,16 +6571,38 @@ setTimeout(backupReminder, 2000);
     statusEl.textContent = text;
   }
 
-  // Group changed rows into requests of bounded size (images can be large).
-  function batches(items) {
+  // A row bigger than PART_CHARS is cut into numbered parts (split by character, never inside one).
+  function encodeRow(id, r) {
+    const s = JSON.stringify(r);
+    if (s.length <= PART_CHARS) return [{ row_id: id, data: r }];
+    const chars = Array.from(s), n = Math.ceil(chars.length / PART_CHARS), parts = [];
+    for (let k = 0; k < n; k++) {
+      parts.push({ row_id: id + '#' + k, data: { __part: k, __of: n, __json: chars.slice(k * PART_CHARS, (k + 1) * PART_CHARS).join('') } });
+    }
+    return parts;
+  }
+  function partIds(id, m) {
+    if (!m || m.n <= 1) return [id];
+    const out = []; for (let k = 0; k < m.n; k++) out.push(id + '#' + k);
+    return out;
+  }
+
+  // Group changed rows into requests of bounded size.
+  function batches(units) {
     const out = []; let cur = [], size = 0;
-    for (const it of items) {
-      const s = JSON.stringify(it.r).length;
+    for (const u of units) {
+      const s = u.parts.reduce((a, p) => a + JSON.stringify(p.data).length, 0);
       if (cur.length && size + s > MAX_BATCH_CHARS) { out.push(cur); cur = []; size = 0; }
-      cur.push(it); size += s;
+      cur.push(u); size += s;
     }
     if (cur.length) out.push(cur);
     return out;
+  }
+
+  async function retire(t, ids, now) {
+    const { error } = await client.from('clinic_rows').update({ deleted_at: now })
+      .match({ owner_id: session.user.id, device_id: deviceId(), table_name: t }).in('row_id', ids);
+    if (error) throw error;
   }
 
   // Upload only rows that changed since the last successful upload.
@@ -6591,20 +6615,28 @@ setTimeout(backupReminder, 2000);
       for (const r of query('SELECT * FROM ' + t)) {
         const id = rowId(t, r); seen.add(id);
         const h = hash(JSON.stringify(r));
-        if (prev[id] !== h) changed.push({ id, h, r });
+        const old = meta(prev[id]);
+        if (!old || old.h !== h) changed.push({ id, h, parts: encodeRow(id, r), old });
       }
       for (const batch of batches(changed)) {
-        const rows = batch.map(c => ({ owner_id: owner, device_id: dev, table_name: t, row_id: c.id, data: c.r, deleted_at: null }));
+        const rows = [];
+        for (const u of batch) for (const p of u.parts)
+          rows.push({ owner_id: owner, device_id: dev, table_name: t, row_id: p.row_id, data: p.data, deleted_at: null });
         const { error } = await client.from('clinic_rows').upsert(rows, { onConflict: 'owner_id,device_id,table_name,row_id' });
         if (error) throw error;
-        batch.forEach(c => { prev[c.id] = c.h; });
+        for (const u of batch) {
+          if (u.old) {   // retire parts the row no longer uses (it shrank or changed form)
+            const keep = new Set(u.parts.map(p => p.row_id));
+            const stale = partIds(u.id, u.old).filter(x => !keep.has(x));
+            if (stale.length) await retire(t, stale, now);
+          }
+          prev[u.id] = { h: u.h, n: u.parts.length };
+        }
         saveState(st); sent += batch.length;
       }
       for (const id of Object.keys(prev)) {
-        if (seen.has(id)) continue;   // still present locally
-        const { error } = await client.from('clinic_rows').update({ deleted_at: now })
-          .match({ owner_id: owner, device_id: dev, table_name: t, row_id: id });
-        if (error) throw error;
+        if (seen.has(id)) continue;   // removed locally: soft delete in the cloud
+        await retire(t, partIds(id, meta(prev[id])), now);
         delete prev[id]; saveState(st); sent++;
       }
     }
@@ -6637,7 +6669,7 @@ setTimeout(backupReminder, 2000);
     clearTimeout(timer); timer = setTimeout(syncNow, delay);
   }
 
-  // All remote rows that are still live, paged (PostgREST returns at most 1000 per request).
+  // All live remote rows, paged (PostgREST returns at most 1000 per request).
   async function fetchRemote() {
     const all = [];
     for (let from = 0; ; from += 1000) {
@@ -6654,13 +6686,33 @@ setTimeout(backupReminder, 2000);
   }
   const newestOf = rows => rows.length ? rows.reduce((a, b) => (b.updated_at > a.updated_at ? b : a)) : null;
 
+  // Put big rows back together from their parts. Refuses to restore a broken row.
+  function assemble(rows) {
+    const whole = [], groups = new Map();
+    for (const r of rows) {
+      if (r.data && r.data.__part !== undefined) {
+        const key = r.table_name + '\u0001' + r.row_id.replace(/#\d+$/, '');
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(r);
+      } else whole.push(r);
+    }
+    for (const parts of groups.values()) {
+      parts.sort((a, b) => a.data.__part - b.data.__part);
+      if (parts.length !== parts[0].data.__of || parts.some((p, i) => p.data.__part !== i))
+        throw new Error('données incomplètes dans le cloud (' + parts[0].table_name + ')');
+      whole.push({ table_name: parts[0].table_name, device_id: parts[0].device_id,
+        data: JSON.parse(parts.map(p => p.data.__json).join('')) });
+    }
+    return whole;
+  }
+
   // Replace this browser's data with the most recently written device in the cloud.
   async function restoreFromCloud() {
     const rows = await fetchRemote();
     const newest = newestOf(rows);
     if (!newest) return false;
     const dev = newest.device_id;
-    const mine = rows.filter(r => r.device_id === dev);
+    const mine = assemble(rows.filter(r => r.device_id === dev));   // throws before any local change
     db.run('BEGIN');
     try {
       for (const t of TABLES) {
@@ -6679,6 +6731,15 @@ setTimeout(backupReminder, 2000);
     localStorage.removeItem(STATE_KEY);     // next upload re-sends everything under this device (idempotent)
     flushDB();
     return true;
+  }
+
+  // Plain-language messages for the sign-in screen.
+  function authMessage(err) {
+    const m = (err && err.message) || '';
+    if (/invalid login credentials/i.test(m)) return 'Email ou mot de passe incorrect. Pas encore de compte ? Cliquez sur « Créer le compte ».';
+    if (/email not confirmed/i.test(m)) return 'Confirmez d’abord votre email (lien reçu par email), puis reconnectez-vous.';
+    if (/already registered|already been registered|already exists/i.test(m)) return 'Un compte existe déjà avec cet email : cliquez sur « Se connecter ».';
+    return 'Erreur : ' + (m || 'réessayez');
   }
 
   function showLogin(message) {
@@ -6701,16 +6762,16 @@ setTimeout(backupReminder, 2000);
     o.querySelector('#cl-form').onsubmit = async ev => {
       ev.preventDefault(); msg('Connexion…');
       const { data, error } = await client.auth.signInWithPassword({ email: email(), password: pass() });
-      if (error) return msg('Connexion refusée : ' + error.message);
+      if (error) return msg(authMessage(error));
       o.remove(); session = data.session; afterLogin();
     };
     o.querySelector('#cl-up').onclick = async () => {
       if (!o.querySelector('#cl-form').reportValidity()) return;
       msg('Création du compte…');
       const { data, error } = await client.auth.signUp({ email: email(), password: pass() });
-      if (error) return msg('Création impossible : ' + error.message);
+      if (error) return msg(authMessage(error));
       if (data.session) { o.remove(); session = data.session; afterLogin(); }
-      else msg('Compte créé. Confirmez votre email, puis connectez-vous.');
+      else msg('Compte créé. Ouvrez l’email de confirmation, puis connectez-vous.');
     };
   }
 
@@ -6735,7 +6796,7 @@ setTimeout(backupReminder, 2000);
 
   function manualRestore() {
     confirmAction('Restaurer depuis le cloud ? Les données de cet appareil seront remplacées par la dernière version du cloud. Une sauvegarde JSON est téléchargée avant.', async () => {
-      try { exportDB(); } catch (e) { /* export is a safety net; keep going */ }
+      try { exportDB(); } catch (e) { /* the export is a safety net; keep going */ }
       setStatus('busy', '☁️ Restauration…');
       try {
         if (await restoreFromCloud()) location.reload();
@@ -6767,7 +6828,7 @@ setTimeout(backupReminder, 2000);
     }
   }
 
-  // Hook into the existing local save path: every local write also schedules a cloud upload.
+  // Every local save also schedules a cloud upload.
   const localFlush = flushDB;
   flushDB = function () { localFlush(); schedule(2500); };
   window.addEventListener('online', () => schedule(500));
